@@ -1,0 +1,1 @@
+FROM mariadb@sha256:ef34af04bda12e6c85395328af78d562176c34fb29ae52063a4eb0d68fa7b3e9
