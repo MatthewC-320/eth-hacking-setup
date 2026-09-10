@@ -157,3 +157,17 @@ apparmor is a good idea for both the webserver and the mariadb instance ( care s
 *Debug mode off, verbose errors off*  
 *Security headers. Content-Security-Policy, X-Content-Type-Options: nosniff, X-Frame-Options.*
 
+
+### bibliography
+
+vulns:
+
+SSTI https://cwe.mitre.org/data/definitions/1336.html
+LFI https://cwe.mitre.org/data/definitions/22.html
+erorr-based globbing filename oracle https://cwe.mitre.org/data/definitions/209.html and https://cwe.mitre.org/data/definitions/73.html
+
+multipolygon OOB MDEV-40328 https://jira.mariadb.org/browse/MDEV-40328 https://cwe.mitre.org/data/definitions/125.html
+sys_refcursor uaf has no specific mdev but https://cwe.mitre.org/data/definitions/416.html
+
+docker escape: best fit is https://cwe.mitre.org/data/definitions/250.html
+command injection: https://cwe.mitre.org/data/definitions/78.html
