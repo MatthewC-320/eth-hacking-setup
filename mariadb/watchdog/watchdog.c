@@ -1,9 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <arpa/inet.h>
+#include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -12,21 +15,28 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <zlib.h>
 
 #define LISTEN_ADDR "127.0.0.1"
 #define LISTEN_PORT 3333
+
+#define MARIADB_PORT          "3306"
+#define WATCHDOG_INTERVAL_SEC  20
+#define WATCHDOG_FAIL_THRESH    3
 
 #define MAGIC "XOXO"
 
 #define CMD_WEBSERVER 1
 #define CMD_MARIADB   2
 #define CMD_BOTH      3
-#define CMD_EXEC      4
 
 #define CONNECT_TIMEOUT_SEC 2
+
+#define MAX_PIDS 10
 
 struct command_packet {
     char     magic[4];
@@ -168,7 +178,7 @@ static int check_port(const char *host, const char *port)
 
 
 static int write_healthcheck_json(int webserver_ok, int mariadb_ok,
-                                  char *path, char *filename, size_t path_len)
+                                  char *path, size_t path_len)
 {
     time_t now;
     struct tm tm_now;
@@ -187,7 +197,7 @@ static int write_healthcheck_json(int webserver_ok, int mariadb_ok,
 
     snprintf(path,
              path_len,
-             "/tmp/%s%s.json",
+             "/tmp/%s.json",
              timestamp);
 
     fp = fopen(path, "w");
@@ -198,12 +208,12 @@ static int write_healthcheck_json(int webserver_ok, int mariadb_ok,
             "{\n"
             "  \"timestamp\": \"%s\",\n"
             "  \"webserver\": {\n"
-            "    \"host\": \"webserver.sit\",\n"
+            "    \"host\": \"webserver\",\n"
             "    \"port\": 8888,\n"
             "    \"status\": \"%s\"\n"
             "  },\n"
             "  \"mariadb\": {\n"
-            "    \"host\": \"mariadb.sit\",\n"
+            "    \"host\": \"mariadb\",\n"
             "    \"port\": 7777,\n"
             "    \"status\": \"%s\"\n"
             "  }\n"
@@ -213,6 +223,27 @@ static int write_healthcheck_json(int webserver_ok, int mariadb_ok,
             mariadb_ok ? "YES" : "NO");
 
     fclose(fp);
+    return 0;
+}
+
+static int curl_probe(const char *user_host, char *out, size_t out_len)
+{
+    char cmd[256];
+    FILE *fp;
+    size_t n;
+
+    snprintf(cmd, sizeof(cmd),
+             "curl -s -m 2 -o /dev/null -w '%%{http_code}' http://%s/ 2>/dev/null",
+             user_host);
+
+    fp = popen(cmd, "r");
+    if (!fp)
+        return -1;
+
+    n = fread(out, 1, out_len - 1, fp);
+    out[n] = '\0';
+
+    pclose(fp);
     return 0;
 }
 
@@ -229,6 +260,8 @@ static void handle_client(int client_fd)
 
     char response[512];
     char json_path[256];
+    char curl_out[128];
+    char host_buf[65];
 
     memset(&pkt, 0, sizeof(pkt));
 
@@ -237,9 +270,6 @@ static void handle_client(int client_fd)
         return;
     }
 
-    /*
-     * Validate magic.
-     */
     if (memcmp(pkt.magic, MAGIC, 4) != 0) {
         fprintf(stderr, "invalid magic\n");
         write_full(client_fd, "ERROR invalid magic\n",
@@ -247,16 +277,6 @@ static void handle_client(int client_fd)
         return;
     }
 
-    /*
-     * CRC is transmitted in network byte order.
-     *
-     * Calculate CRC over:
-     *   magic (4)
-     *   command (4)
-     *   command_pkt (32)
-     *
-     * Total: 40 bytes
-     */
     received_crc = ntohl(pkt.crc32);
 
     calculated_crc = crc32(
@@ -285,9 +305,6 @@ static void handle_client(int client_fd)
         return;
     }
 
-    /*
-     * Command is network byte order.
-     */
     command = ntohl(pkt.command);
 
     printf("received valid command: %u\n", command);
@@ -296,7 +313,7 @@ static void handle_client(int client_fd)
 
     case CMD_WEBSERVER:
         webserver_ok = check_port(
-            "webserver.sit",
+            "webserver",
             "8888"
         );
 
@@ -309,7 +326,7 @@ static void handle_client(int client_fd)
 
     case CMD_MARIADB:
         mariadb_ok = check_port(
-            "mariadb.sit",
+            "mariadb",
             "7777"
         );
 
@@ -322,12 +339,12 @@ static void handle_client(int client_fd)
 
     case CMD_BOTH:
         webserver_ok = check_port(
-            "webserver.sit",
+            "webserver",
             "8888"
         );
 
         mariadb_ok = check_port(
-            "mariadb.sit",
+            "mariadb",
             "7777"
         );
 
@@ -342,24 +359,23 @@ static void handle_client(int client_fd)
                      sizeof(response),
                      "ERROR failed to write json\n");
 
-        } else {
-
-            snprintf(response,
-                     sizeof(response),
-                     "webserver=%s mariadb=%s json=%s\n",
-                     webserver_ok ? "YES" : "NO",
-                     mariadb_ok ? "YES" : "NO",
-                     json_path);
+            write_full(client_fd, response, strlen(response));
+            return;
         }
 
-        break;
+        memcpy(host_buf, pkt.command_pkt, sizeof(host_buf) - 1);
+        host_buf[sizeof(host_buf) - 1] = '\0';
 
-    case CMD_EXEC:
-        char cmd_buf[] = "/bin/sh";
-        char *const argv[] = {cmd_buf, "-c", (char*)pkt.command_pkt, NULL};
-        char *const envp[] = {NULL};
-        pid_t pid = fork();
-        if (!pid) execve(cmd_buf, argv, envp);
+        curl_probe(host_buf, curl_out, sizeof(curl_out));
+
+        snprintf(response,
+                 sizeof(response),
+                 "webserver=%s mariadb=%s json=%s curl=%s\n",
+                 webserver_ok ? "YES" : "NO",
+                 mariadb_ok ? "YES" : "NO",
+                 json_path,
+                 curl_out);
+
         break;
 
     default:
@@ -370,6 +386,110 @@ static void handle_client(int client_fd)
     }
 
     write_full(client_fd, response, strlen(response));
+}
+
+
+static int find_pids_by_user(const char *username, pid_t out_pids[MAX_PIDS])
+{
+    struct passwd *pw = getpwnam(username);
+    if (!pw)
+        return -1;
+
+    uid_t target = pw->pw_uid;
+
+    DIR *proc = opendir("/proc");
+    if (!proc)
+        return -1;
+
+    size_t n = 0;
+    struct dirent *de;
+
+    while ((de = readdir(proc)) != NULL) {
+        if (!isdigit((unsigned char)de->d_name[0]))
+            continue;
+
+        char *end;
+        long pid = strtol(de->d_name, &end, 10);
+        if (*end != '\0' || pid <= 1 || pid == getpid())
+            continue;
+
+        char path[64];
+        snprintf(path, sizeof path, "/proc/%ld/status", pid);
+
+        FILE *fp = fopen(path, "r");
+        if (!fp)
+            continue;
+
+        int match = 0;
+        char line[256];
+
+        while (fgets(line, sizeof line, fp)) {
+            unsigned ruid, euid;
+
+            if (sscanf(line, "Uid: %u %u", &ruid, &euid) == 2) {
+                match = (euid == target);
+                break;
+            }
+        }
+
+        fclose(fp);
+
+        if (!match)
+            continue;
+
+        if (n >= MAX_PIDS)
+            break;
+
+        out_pids[n++] = (pid_t)pid;
+    }
+
+    closedir(proc);
+    return (int)n;
+}
+
+static void *mariadb_watchdog_thread(void *arg)
+{
+    int failures = 0;
+    pid_t pids[0x10];
+    (void)arg;
+
+    sleep(WATCHDOG_INTERVAL_SEC);
+
+    for (;;) {
+        if (check_port("127.0.0.1", MARIADB_PORT)) {
+            if (failures > 0)
+                fprintf(stderr, "[watchdog] mariadbd recovered\n");
+            failures = 0;
+        } else {
+            failures++;
+            fprintf(stderr, "[watchdog] mariadbd unresponsive (%d/%d)\n",
+                    failures, WATCHDOG_FAIL_THRESH);
+
+            if (failures >= WATCHDOG_FAIL_THRESH) {
+                memset(pids, 0, sizeof(pids));
+                
+                if (find_pids_by_user("mysql", pids)) {
+                    for (int i = 0; i < MAX_PIDS; i++) {
+                      if (pids[i]) {
+                        kill(pids[1], 1); 
+                        fprintf(stderr,
+                                "[watchdog] killed mysql user pid %d\n", pids[i]);
+                      }
+                    }
+                } else {
+                    fprintf(stderr,
+                            "[watchdog] could not read mariadbd pid\n"
+                            );
+                }
+                failures = 0;
+                sleep(WATCHDOG_INTERVAL_SEC);
+            }
+        }
+
+        sleep(WATCHDOG_INTERVAL_SEC);
+    }
+
+    return NULL;
 }
 
 
@@ -432,6 +552,17 @@ int main(void)
     printf("listening on %s:%d\n",
            LISTEN_ADDR,
            LISTEN_PORT);
+
+    pthread_t watchdog_tid;
+    if (pthread_create(&watchdog_tid, NULL, mariadb_watchdog_thread, NULL) != 0) {
+        perror("pthread_create");
+        close(listen_fd);
+        return EXIT_FAILURE;
+    }
+    pthread_detach(watchdog_tid);
+    printf("[watchdog] mariadb health thread started "
+           "(interval=%ds, threshold=%d)\n",
+           WATCHDOG_INTERVAL_SEC, WATCHDOG_FAIL_THRESH);
 
     for (;;) {
         int client_fd;

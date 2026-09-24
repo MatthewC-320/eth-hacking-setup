@@ -1,15 +1,18 @@
-FROM python:latest
+FROM python:3.13-slim
 WORKDIR /app
 COPY requirements.txt /app/
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends netcat-openbsd libmariadb-dev gcc curl && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . /app
 EXPOSE 5000
 
-
-RUN gcc /app/getflag.c -o /app/getflag && \
-    rm /app/getflag.c
-
 RUN mkdir /app/key
+
+
 
 RUN useradd -m lain && \
     chown -R lain:lain /app && \
@@ -17,10 +20,6 @@ RUN useradd -m lain && \
     chmod 500 /app/* && \
     chmod 700 /app/key
 
-RUN chmod 400 /app/flag.txt
-RUN chown root:root /app/flag.txt
-RUN chown root:root /app/getflag
-RUN chmod 4755 /app/getflag
 USER lain
 
-CMD ["python", "lain_app.py"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers=2", "lain_app:app"]

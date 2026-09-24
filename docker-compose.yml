@@ -4,10 +4,8 @@ services:
       context: ./website
     container_name: lain-web
     ports:
-      - "8888:5000"        # confirmed: Dockerfile EXPOSEs 5000, CMD runs lain_app.py
+      - "8888:5000"
     environment:
-      # These are what an attacker finds after RCE (e.g. via `env`) —
-      # matches the credentials mariadb/start.sh already provisions.
       MARIADB_HOST: mariadb
       MARIADB_USER: example-user
       MARIADB_PASSWORD: my_cool_secret
@@ -27,25 +25,17 @@ services:
       context: ./mariadb
     container_name: lain-mariadb
     environment:
-      MARIADB_ROOT_PASSWORD: changeme123   # move to a .env file once this is more than a local dev box
+      MARIADB_ROOT_PASSWORD: changeme123
       MARIADB_USER: example-user
       MARIADB_PASSWORD: my_cool_secret
       MARIADB_DATABASE: appdb
-    # Intentionally over-privileged — required later for the docker-escape phase.
-    cap_add:
-      - SYS_ADMIN
     networks:
       - labnet
-    # No `ports:` mapping here on purpose: this keeps MariaDB reachable ONLY
-    # from other containers on `labnet` (i.e. from `website` after RCE),
-    # never from outside the host at all.
-    #
-    # If you personally need host-side access for debugging, bind to loopback
-    # only — never 0.0.0.0 — e.g.:
-    # ports:
-    #   - "127.0.0.1:7777:3306"
+
     restart: unless-stopped
+    init: true
 
 networks:
   labnet:
     driver: bridge
+
